@@ -344,4 +344,9 @@ struct CompatibilityFlags @0x8f8c1b68151b6cef {
   webgpu @35 :Bool
       $compatEnableFlag("webgpu")
       $experimental;
+
+  jsRpcStub @36 :Bool
+      $compatEnableFlag("durable_object_js_rpc")
+      $experimental;
+  # Enables JS RPC method on durable object stub.
 }

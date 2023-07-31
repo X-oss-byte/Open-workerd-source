@@ -172,4 +172,23 @@ JsValue structuredClone(
   return des.readValue(js);
 }
 
+kj::Array<kj::byte> serializeV8Rpc(jsg::Lock& js, jsg::JsValue value) {
+  jsg::Serializer serializer(js, jsg::Serializer::Options {
+    .version = 15,
+    .omitHeader = false,
+  });
+  serializer.write(js, value);
+  auto released = serializer.release();
+  return kj::mv(released.data);
+}
+
+jsg::JsValue deserializeV8Rpc(jsg::Lock& js, kj::Array<const kj::byte> ser) {
+  jsg::Deserializer deserializer(js, kj::mv(ser), nullptr, nullptr,
+      jsg::Deserializer::Options {
+    .version = 15,
+    .readHeader = true,
+  });
+
+  return deserializer.readValue(js);
+}
 }  // namespace workerd::jsg

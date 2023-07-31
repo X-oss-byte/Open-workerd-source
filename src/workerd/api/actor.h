@@ -20,13 +20,45 @@ namespace workerd {
 
 namespace workerd::api {
 
+enum IsInHouse {
+  YES,
+  NO,
+};
+
+// TODO(soon): This will eventually become the Proxy object.
+// This class extends Fetcher with the JS RPC call function, but doesn't go as far as DurableObject.
+// We don't want to define RPC stuff on Fetcher itself, and since ColoLocalActorNamespace::get()
+// doesn't return a DurableObject, we can't define it there either. Instead, we use a class that's
+// somewhere in-between.
+class DurableObjectRpcStub : public Fetcher {
+public:
+  DurableObjectRpcStub(
+      IoOwn<OutgoingFactory> outgoingFactory,
+      RequiresHostAndProtocol requiresHost,
+      IsInHouse inHouse)
+    : Fetcher(kj::mv(outgoingFactory), requiresHost, (inHouse == YES) /* isInHouse */) {}
+
+  jsg::Promise<jsg::V8Ref<v8::Value>> getRpcAndCallRemote(
+      jsg::Lock& js, kj::String methodName, jsg::Optional<kj::Array<jsg::Value>> args=nullptr);
+  // TODO(now): We won't merge with this test function -- it only exists for testing remote calls.
+  // Get an rpc service and call the remote method.
+  // This will evolve once we have a proxy type and can intercept method calls.
+
+  JSG_RESOURCE_TYPE(DurableObjectRpcStub, CompatibilityFlags::Reader flags) {
+    JSG_INHERIT(Fetcher);
+    if (flags.getJsRpcStub()) {
+      JSG_METHOD(getRpcAndCallRemote);
+    }
+  }
+};
+
 // A capability to an ephemeral Actor namespace.
 class ColoLocalActorNamespace: public jsg::Object {
 public:
   ColoLocalActorNamespace(uint channel)
     : channel(channel) {}
 
-  jsg::Ref<Fetcher> get(kj::String actorId);
+  jsg::Ref<DurableObjectRpcStub> get(kj::String actorId);
 
   JSG_RESOURCE_TYPE(ColoLocalActorNamespace) {
     JSG_METHOD(get);
@@ -69,19 +101,19 @@ private:
 };
 
 // Stub object used to send messages to a remote durable object.
-class DurableObject: public Fetcher {
+class DurableObject: public DurableObjectRpcStub {
 
 public:
   DurableObject(jsg::Ref<DurableObjectId> id, IoOwn<OutgoingFactory> outgoingFactory,
                 RequiresHostAndProtocol requiresHost)
-    : Fetcher(kj::mv(outgoingFactory), requiresHost, true /* isInHouse */),
+    : DurableObjectRpcStub(kj::mv(outgoingFactory), requiresHost, IsInHouse::YES),
       id(kj::mv(id)) {}
 
   jsg::Ref<DurableObjectId> getId() { return id.addRef(); };
   jsg::Optional<kj::StringPtr> getName() { return id->getName(); }
 
   JSG_RESOURCE_TYPE(DurableObject) {
-    JSG_INHERIT(Fetcher);
+    JSG_INHERIT(DurableObjectRpcStub);
 
     JSG_READONLY_INSTANCE_PROPERTY(id, getId);
     JSG_READONLY_INSTANCE_PROPERTY(name, getName);
@@ -196,6 +228,7 @@ private:
 };
 
 #define EW_ACTOR_ISOLATE_TYPES                      \
+  api::DurableObjectRpcStub,                        \
   api::ColoLocalActorNamespace,                     \
   api::DurableObject,                               \
   api::DurableObjectId,                             \

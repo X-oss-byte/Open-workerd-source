@@ -540,6 +540,9 @@ private:
   kj::OneOf<uint, kj::Own<CrossContextOutgoingFactory>, IoOwn<OutgoingFactory>> channelOrClientFactory;
   RequiresHostAndProtocol requiresHost;
   bool isInHouse;
+  kj::Maybe<rpc::JsRpcTarget::Client> rpcCap = nullptr;
+  // TODO(now): If we switch to using a session-like model, we can store the rpc capability here.
+  // For now, we drop the capability once we finish the callRequest.
 };
 
 // Type of the second parameter to Request's constructor. Also the type of the second parameter

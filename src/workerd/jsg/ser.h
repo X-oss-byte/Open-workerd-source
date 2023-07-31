@@ -112,4 +112,8 @@ JsValue structuredClone(
     const JsValue& value,
     kj::Maybe<kj::Array<JsValue>> maybeTransfer = nullptr);
 
+  kj::Array<kj::byte> serializeV8Rpc(jsg::Lock& js, jsg::JsValue value);
+  jsg::JsValue deserializeV8Rpc(jsg::Lock& js, kj::Array<const kj::byte> ser);
+  // TODO(now): At minimum, we should remove "Rpc". If we end up using this less than I suspect we
+  // will, we shoulds just remove these entirely.
 }  // namespace workerd::jsg
