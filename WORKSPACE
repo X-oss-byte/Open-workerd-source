@@ -307,7 +307,7 @@ npm_repositories()
 
 http_archive(
     name = "v8",
-    sha256 = "b2e61fb39cdb6ea25ec0a9bef83717354a9020cdaf7f77e3210f2574d791c4b7",
+    sha256 = "7eef442f759f1a26cba8269f293596b3d4f7ad441541f875ab48fd6d170f1263",
     patch_args = ["-p1"],
     patches = [
         "//:patches/v8/0001-Allow-manually-setting-ValueDeserializer-format-vers.patch",
@@ -321,21 +321,21 @@ http_archive(
         "//:patches/v8/0009-Speed-up-V8-bazel-build-by-always-using-target-cfg.patch",
         "//:patches/v8/0010-Implement-Promise-Context-Tagging.patch",
         "//:patches/v8/0011-Enable-V8-shared-linkage.patch",
-        "//:patches/v8/0012-Fix-ICU-build.patch",
+        "//:patches/v8/0012-Fix-V8-ICU-build.patch",
     ],
-    strip_prefix = "v8-v8-97c6f93",
+    strip_prefix = "v8-v8-374ca7a",
     type = "tgz",
-    url = "https://github.com/v8/v8/tarball/97c6f935aa8ec6b786f7ff7726f86785316f30d0",
+    url = "https://github.com/v8/v8/tarball/374ca7a87c62a2b7367da819068ae012ea5272e1",
 )
 
 new_git_repository(
     name = "com_googlesource_chromium_icu",
     build_file = "@v8//:bazel/BUILD.icu",
-    commit = "e8c3bc9ea97d4423ad0515e5f1c064f486dae8b1",
+    commit = "de4ce0071eb47ed54cbda54869001210cf3a8ae5",
     patch_cmds = ["find source -name BUILD.bazel | xargs rm"],
     patch_cmds_win = ["Get-ChildItem -Path source -File -Include BUILD.bazel -Recurse | Remove-Item"],
     remote = "https://chromium.googlesource.com/chromium/deps/icu.git",
-    shallow_since = "1686777134 +0000"
+    shallow_since = "1690331196 +0000"
 )
 
 new_git_repository(
