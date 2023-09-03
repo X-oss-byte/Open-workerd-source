@@ -260,7 +260,7 @@ jsg::Ref<Socket> connectImpl(
 jsg::Promise<void> Socket::close(jsg::Lock& js) {
   // Forcibly close the readable/writable streams.
   auto cancelPromise = readable->getController().cancel(js, nullptr);
-  auto abortPromise = writable->getController().abort(js, nullptr);
+  auto abortPromise = writable->getController().abort(js, js.v8Error("Stream was aborted."));
   // The below is effectively `Promise.all(cancelPromise, abortPromise)`
   return cancelPromise.then(js, [abortPromise = kj::mv(abortPromise), this](jsg::Lock& js) mutable {
     return abortPromise.then(js, [this](jsg::Lock& js) {
@@ -357,7 +357,7 @@ void Socket::handleProxyStatus(jsg::Lock& js, kj::Promise<kj::Maybe<kj::Exceptio
 void Socket::handleProxyError(jsg::Lock& js, kj::Exception e) {
   resolveFulfiller(js, kj::mv(e));
   readable->getController().cancel(js, nullptr).markAsHandled(js);
-  writable->getController().abort(js, nullptr).markAsHandled(js);
+  writable->getController().abort(js, js.v8Error(e.getDescription())).markAsHandled(js);
 }
 
 void Socket::handleReadableEof(jsg::Lock& js, jsg::Promise<void> onEof) {
