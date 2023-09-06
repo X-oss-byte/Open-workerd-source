@@ -110,7 +110,7 @@ private:
       KJ_IF_MAYBE(package, activeOrPackage.tryGet<api::WebSocket::HibernationPackage>()) {
         activeOrPackage.init<jsg::Ref<api::WebSocket>>(
             api::WebSocket::hibernatableFromNative(js, *KJ_REQUIRE_NONNULL(ws), kj::mv(*package))
-        )->setAutoResponseTimestamp(autoResponseTimestamp);
+        )->setAutoResponseTimestamp(autoResponseTimestamp, kj::mv(maybeAutoResponsePromise));
         // Now that we unhibernated the WebSocket, we can set the last received autoResponse timestamp
         // that was stored in the corresponding HibernatableWebSocket.
       }
@@ -150,6 +150,8 @@ private:
 
     // Stores the last received autoResponseRequest timestamp.
     kj::Maybe<kj::Date> autoResponseTimestamp;
+
+    kj::Maybe<kj::Promise<void>&> maybeAutoResponsePromise;
 
     friend HibernationManagerImpl;
   };

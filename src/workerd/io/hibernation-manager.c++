@@ -188,10 +188,10 @@ kj::Promise<void> HibernationManagerImpl::readLoop(HibernatableWebSocket& hib) {
 
     auto skip = false;
 
-    KJ_IF_MAYBE (reqResp, autoResponsePair) {
+    KJ_IF_SOME (reqResp, autoResponsePair) {
       KJ_SWITCH_ONEOF(message) {
         KJ_CASE_ONEOF(text, kj::String) {
-          if (text == (*reqResp)->getRequest()) {
+          if (text == reqResp->getRequest()) {
             // If the received message matches the one set for auto-response, we must
             // short-circuit readLoop, store the current timestamp and and automatically respond
             // with the expected response.
@@ -202,12 +202,22 @@ kj::Promise<void> HibernationManagerImpl::readLoop(HibernatableWebSocket& hib) {
             // We'll store the current timestamp in the HibernatableWebSocket to assure it gets
             // stored even if the WebSocket is currently hibernating. In that scenario, the timestamp
             // value will be loaded into the WebSocket during unhibernation.
-            KJ_IF_MAYBE(active, hib.activeOrPackage.tryGet<jsg::Ref<api::WebSocket>>()) {
+            KJ_IF_SOME(active, hib.activeOrPackage.tryGet<jsg::Ref<api::WebSocket>>()) {
               // If the actor is not hibernated/If the WebSocket is active, we need to update
               // autoResponseTimestamp on the active websocket.
-              (*active)->setAutoResponseTimestamp(hib.autoResponseTimestamp);
+              active->setAutoResponseTimestamp(hib.autoResponseTimestamp, kj::none);
+              co_await active->sendAutoResponse(kj::str(reqResp->getResponse().asArray()), ws);
+              active->detachAutoResultSend();
+            } else {
+              if (!hib.activeOrPackage.get<api::WebSocket::HibernationPackage>().closedOutgoingConnection) {
+                // We need to store the autoResponsePromise because we may instantiate an api::websocket
+                // If we do that, we have to provide it with the promise to avoid races.
+                auto p = ws.send(reqResp->getResponse().asArray());
+                hib.maybeAutoResponsePromise = p;
+                co_await p;
+                hib.maybeAutoResponsePromise = kj::none;
+              }
             }
-            ws.send((*reqResp)->getResponse().asArray());
             skip = true;
             // If we've sent an auto response message, we should not unhibernate or deliver the
             // received message to the actor

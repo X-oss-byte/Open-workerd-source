@@ -47,6 +47,7 @@ WebSocket::WebSocket(jsg::Lock& js,
       serializedAttachment(kj::mv(package.serializedAttachment)),
       farNative(initNative(ioContext, ws, package.closedOutgoingConnection)),
       outgoingMessages(IoContext::current().addObject(kj::heap<OutgoingMessagesMap>())),
+      pendingAutoResponseQueue(kj::Table<kj::String, kj::InsertionOrderIndex>()),
       locality(LOCAL) {}
   // This constructor is used when reinstantiating a websocket that had been hibernating, which is
   // why we can go straight to the Accepted state. However, note that we are actually in the
@@ -63,6 +64,7 @@ WebSocket::WebSocket(kj::Own<kj::WebSocket> native, Locality locality)
     : url(nullptr),
       farNative(nullptr),
       outgoingMessages(IoContext::current().addObject(kj::heap<OutgoingMessagesMap>())),
+      pendingAutoResponseQueue(kj::Table<kj::String, kj::InsertionOrderIndex>()),
       locality(locality) {
   auto nativeObj = kj::heap<Native>();
   nativeObj->state.init<AwaitingAcceptanceOrCoupling>(kj::mv(native));
@@ -73,6 +75,7 @@ WebSocket::WebSocket(kj::String url, Locality locality)
     : url(kj::mv(url)),
       farNative(nullptr),
       outgoingMessages(IoContext::current().addObject(kj::heap<OutgoingMessagesMap>())),
+      pendingAutoResponseQueue(kj::Table<kj::String, kj::InsertionOrderIndex>()),
       locality(locality) {
   auto nativeObj = kj::heap<Native>();
   nativeObj->state.init<AwaitingConnection>();
@@ -531,7 +534,10 @@ void WebSocket::send(jsg::Lock& js, kj::OneOf<kj::Array<byte>, kj::String> messa
 
     KJ_UNREACHABLE;
   }();
-  outgoingMessages->insert(GatedMessage{kj::mv(maybeOutputLock), kj::mv(msg)});
+
+  auto n = pendingAutoResponseQueue.size() - queuedAutoResponses;
+  queuedAutoResponses = pendingAutoResponseQueue.size();
+  outgoingMessages->insert(GatedMessage{kj::mv(maybeOutputLock), kj::mv(msg), n});
 
   ensurePumping(js);
 }
@@ -578,13 +584,15 @@ void WebSocket::close(
         "If you specify a WebSocket close reason, you must also specify a code.");
   }
 
+  auto n = pendingAutoResponseQueue.size() - queuedAutoResponses;
+  queuedAutoResponses = pendingAutoResponseQueue.size();
   outgoingMessages->insert(GatedMessage{
       IoContext::current().waitForOutputLocksIfNecessary(),
       kj::WebSocket::Close {
         // Code 1005 actually translates to sending a close message with no body on the wire.
         static_cast<uint16_t>(code.orDefault(1005)),
         kj::mv(reason).orDefault(nullptr),
-      },
+      }, n
   });
 
   native.closedOutgoing = true;
@@ -670,8 +678,10 @@ void WebSocket::serializeAttachment(jsg::Lock& js, jsg::JsValue attachment) {
   serializedAttachment = kj::mv(released.data);
 }
 
-void WebSocket::setAutoResponseTimestamp(kj::Maybe<kj::Date> time) {
+void WebSocket::setAutoResponseTimestamp(kj::Maybe<kj::Date> time,
+    kj::Maybe<kj::Promise<void>&> maybeAutoResponsePromise) {
   autoResponseTimestamp = time;
+  maybeOngoingAutoResponse = maybeAutoResponsePromise;
 }
 
 
@@ -689,7 +699,9 @@ void WebSocket::ensurePumping(jsg::Lock& js) {
     auto& context = IoContext::current();
     auto& accepted = KJ_ASSERT_NONNULL(native.state.tryGet<Accepted>());
     auto promise = kj::evalNow([&]() {
-      return accepted.canceler.wrap(pump(context, *outgoingMessages, *accepted.ws, native));
+      return accepted.canceler.wrap(pump(context, *outgoingMessages,
+      *accepted.ws, native, kj::mv(maybeOngoingAutoResponse),
+      isPumping, isClosed, pendingAutoResponseQueue, queuedAutoResponses));
     });
 
     // TODO(cleanup): We use awaitIoLegacy() here because we don't want this to count as a pending
@@ -729,6 +741,23 @@ void WebSocket::ensurePumping(jsg::Lock& js) {
   }
 }
 
+kj::Promise<void> WebSocket::sendAutoResponse(kj::String message, kj::WebSocket& ws) {
+  if (isPumping) {
+    pendingAutoResponseQueue.insert(kj::mv(message));
+  } else {
+    if (!isClosed){
+      auto p = ws.send(message);
+      maybeOngoingAutoResponse = p;
+      return p;
+    }
+  }
+  return kj::READY_NOW;
+}
+
+void WebSocket::detachAutoResultSend() {
+  maybeOngoingAutoResponse = nullptr;
+}
+
 namespace {
 
 size_t countBytesFromMessage(const kj::WebSocket::Message& message) {
@@ -757,9 +786,12 @@ size_t countBytesFromMessage(const kj::WebSocket::Message& message) {
 } // namespace
 
 kj::Promise<void> WebSocket::pump(
-    IoContext& context, OutgoingMessagesMap& outgoingMessages, kj::WebSocket& ws, Native& native) {
+    IoContext& context, OutgoingMessagesMap& outgoingMessages, kj::WebSocket& ws, Native& native,
+    kj::Maybe<kj::Promise<void>&> maybeOngoingAutoResponse, bool& isPumping, bool& isClosed,
+    kj::Table<kj::String, kj::InsertionOrderIndex>& pendingAutoResponseQueue, size_t& queuedAutoResponses) {
   KJ_ASSERT(!native.isPumping);
   native.isPumping = true;
+  isPumping = true;
   KJ_DEFER({
     // We use a KJ_DEFER to set native.isPumping = false to ensure that it happens -- we had a bug
     // in the past where this was handled by the caller of WebSocket::pump() and it allowed for
@@ -769,7 +801,19 @@ kj::Promise<void> WebSocket::pump(
     // Either we were already through all our outgoing messages or we experienced failure/
     // cancellation and cannot send these anyway.
     outgoingMessages.clear();
+
+    isPumping = false;
+
+    if (pendingAutoResponseQueue.size() > 0) {
+      pendingAutoResponseQueue.clear();
+    }
   });
+
+  // If we have an maybeOngoingAutoResponse, we must co_await it here because there's a ws.send()
+  // in progress. Otherwise there can occur ws.send() race problems.
+  KJ_IF_MAYBE(sendPromise, maybeOngoingAutoResponse) {
+    co_await *sendPromise;
+  }
 
   while (outgoingMessages.size() > 0) {
     GatedMessage gatedMessage = outgoingMessages.release(*outgoingMessages.ordered().begin());
@@ -778,6 +822,14 @@ kj::Promise<void> WebSocket::pump(
     }
 
     auto size = countBytesFromMessage(gatedMessage.message);
+
+    while (gatedMessage.pendingAutoResponses > 0) {
+      KJ_ASSERT(pendingAutoResponseQueue.size() >= gatedMessage.pendingAutoResponses);
+      auto message = pendingAutoResponseQueue.release(*pendingAutoResponseQueue.ordered().begin());
+      gatedMessage.pendingAutoResponses--;
+      queuedAutoResponses--;
+      co_await ws.send(message);
+    }
 
     KJ_SWITCH_ONEOF(gatedMessage.message) {
       KJ_CASE_ONEOF(text, kj::String) {
@@ -790,6 +842,7 @@ kj::Promise<void> WebSocket::pump(
       }
       KJ_CASE_ONEOF(close, kj::WebSocket::Close) {
         co_await ws.close(close.code, close.reason);
+        isClosed = true;
         break;
       }
     }
@@ -797,6 +850,12 @@ kj::Promise<void> WebSocket::pump(
     KJ_IF_MAYBE(a, context.getActor()) {
       a->getMetrics().sentWebSocketMessage(size);
     }
+  }
+  // If there are any auto-responses left to process, we should do it now.
+  // We should also check if the last sent message was a close. Shouldn't happen.
+  while (pendingAutoResponseQueue.size() > 0 && !isClosed) {
+    auto message = pendingAutoResponseQueue.release(*pendingAutoResponseQueue.ordered().begin());
+    co_await ws.send(message);
   }
 }
 

@@ -395,11 +395,16 @@ public:
 
   // Used to get/store the last auto request/response timestamp for this WebSocket.
   // These methods are c++ only and are not exposed to our js interface.
-  void setAutoResponseTimestamp(kj::Maybe<kj::Date> time);
+  void setAutoResponseTimestamp(kj::Maybe<kj::Date> time,
+    kj::Maybe<kj::Promise<void>&> autoResponsePromise);
 
   // Used to get/store the last auto request/response timestamp for this WebSocket.
   // These methods are c++ only and are not exposed to our js interface.
   kj::Maybe<kj::Date> getAutoResponseTimestamp();
+
+  void detachAutoResultSend();
+  kj::Promise<void> sendAutoResponse(kj::String message, kj::WebSocket& ws);
+  kj::Maybe<kj::Promise<void>&> maybeOngoingAutoResponse;
 
   int getReadyState();
 
@@ -642,11 +647,17 @@ private:
   struct GatedMessage {
     kj::Maybe<kj::Promise<void>> outputLock;  // must wait for this before actually sending
     kj::WebSocket::Message message;
+    size_t pendingAutoResponses = 0;
   };
   using OutgoingMessagesMap = kj::Table<GatedMessage, kj::InsertionOrderIndex>;
   // Queue of messages to be sent. This is wraped in a IoOwn so that the pump loop can safely
   // access the map without locking the isolate.
   IoOwn<OutgoingMessagesMap> outgoingMessages;
+
+  kj::Table<kj::String, kj::InsertionOrderIndex> pendingAutoResponseQueue;
+  bool isPumping = false;
+  bool isClosed = false;
+  size_t queuedAutoResponses = 0;
 
   Locality locality;
 
@@ -676,8 +687,11 @@ private:
   // object's members in a thread-unsafe way. `outgoingMessages` and `ws` are both `IoOwn`ed
   // objects so are safe to access from the thread without the isolate lock. The whole task is
   // owned by the `IoContext` so it'll be canceled if the `IoContext` is destroyed.
+  // TODO(cleanup): Group auto-response parameters together.
   static kj::Promise<void> pump(
-      IoContext& context, OutgoingMessagesMap& outgoingMessages, kj::WebSocket& ws, Native& native);
+      IoContext& context, OutgoingMessagesMap& outgoingMessages, kj::WebSocket& ws, Native& native,
+      kj::Maybe<kj::Promise<void>&> maybeOngoingAutoResponse, bool& isPumping, bool& isClosed,
+      kj::Table<kj::String, kj::InsertionOrderIndex>& pendingAutoResponseQueue, size_t& queuedAutoResponses);
 
   kj::Promise<kj::Maybe<kj::Exception>> readLoop();
 
