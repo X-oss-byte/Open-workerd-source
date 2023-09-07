@@ -67,7 +67,7 @@ static kj::String normalizeType(kj::String type) {
   // see if anyone in the wild is relying on the incorrect parsing.
   // If we see this log even once in production then we cannot switch normalizeType
   // for MimeType::tryParse without a compatibility flag.
-  if (MimeType::tryParse(type) == nullptr) {
+  if (MimeType::tryParse(type) == kj::none) {
     LOG_WARNING_ONCE("Blob created with invalid/unparseable content type");
   }
 
@@ -88,9 +88,9 @@ static kj::String normalizeType(kj::String type) {
 
 jsg::Ref<Blob> Blob::constructor(jsg::Optional<Bits> bits, jsg::Optional<Options> options) {
   kj::String type;  // note: default value is intentionally empty string
-  KJ_IF_MAYBE(o, options) {
-    KJ_IF_MAYBE(t, o->type) {
-      type = normalizeType(kj::mv(*t));
+  KJ_IF_SOME(o, options) {
+    KJ_IF_SOME(t, o.type) {
+      type = normalizeType(kj::mv(t));
     }
   }
 
@@ -163,7 +163,7 @@ public:
     if (encoding == StreamEncoding::IDENTITY) {
       return unread.size();
     } else {
-      return nullptr;
+      return kj::none;
     }
   }
 
@@ -203,16 +203,16 @@ jsg::Ref<File> File::constructor(jsg::Optional<Bits> bits,
     kj::String name, jsg::Optional<Options> options) {
   kj::String type;  // note: default value is intentionally empty string
   kj::Maybe<double> maybeLastModified;
-  KJ_IF_MAYBE(o, options) {
-    KJ_IF_MAYBE(t, o->type) {
-      type = normalizeType(kj::mv(*t));
+  KJ_IF_SOME(o, options) {
+    KJ_IF_SOME(t, o.type) {
+      type = normalizeType(kj::mv(t));
     }
-    maybeLastModified = o->lastModified;
+    maybeLastModified = o.lastModified;
   }
 
   double lastModified;
-  KJ_IF_MAYBE(m, maybeLastModified) {
-    lastModified = *m;
+  KJ_IF_SOME(m, maybeLastModified) {
+    lastModified = m;
   } else {
     lastModified = dateNow();
   }
