@@ -22,10 +22,12 @@
 #include <openssl/pem.h>
 #include <workerd/io/actor-cache.h>
 #include <workerd/io/actor-sqlite.h>
+#include <workerd/io/request-tracker.h>
 #include <workerd/util/http-util.h>
 #include <workerd/api/actor-state.h>
 #include <workerd/util/mimetype.h>
 #include "workerd-api.h"
+#include "workerd/io/hibernation-manager.h"
 #include <stdlib.h>
 
 namespace workerd::server {
@@ -1277,7 +1279,7 @@ public:
 
     actorNamespaces.reserve(actorClasses.size());
     for (auto& entry: actorClasses) {
-      auto ns = kj::heap<ActorNamespace>(*this, entry.key, entry.value);
+      auto ns = kj::heap<ActorNamespace>(*this, entry.key, entry.value, threadContext.getUnsafeTimer());
       actorNamespaces.insert(entry.key, kj::mv(ns));
     }
   }
@@ -1341,8 +1343,13 @@ public:
 
   class ActorNamespace final: private kj::TaskSet::ErrorHandler {
   public:
-    ActorNamespace(WorkerService& service, kj::StringPtr className, const ActorConfig& config)
-        : service(service), className(className), config(config), onBrokenTasks(*this) {}
+    ActorNamespace(WorkerService& service,kj::StringPtr className, const ActorConfig& config,
+        kj::Timer& timer)
+        : service(service),
+          className(className),
+          config(config),
+          onBrokenTasks(*this),
+          timer(timer) {}
 
     const ActorConfig& getConfig() { return config; }
 
@@ -1373,12 +1380,85 @@ public:
       return kj::heap<ActorChannelImpl>(*this, kj::mv(id));
     }
 
+    // ActorContainer mostly serves as a wrapper around Worker::Actor.
+    // We use it to associate a HibernationManager with the Worker::Actor, since the
+    // Worker::Actor can be destroyed during periods of prolonged inactivity.
+    //
+    // We use a RequestTracker to track strong references to this ActorContainer's Worker::Actor.
+    // Once there are no Worker::Actor's left (excluding our own), `inactive()` is triggered and we
+    // initiate the eviction of the Durable Object. If no requests arrive in the next 10 seconds,
+    // the DO is evicted, otherwise we cancel the eviction task.
+    class ActorContainer final: public RequestTracker::Hooks {
+    public:
+      ActorContainer(kj::String key, ActorNamespace& parent, kj::Timer& timer)
+          : tracker(kj::refcounted<RequestTracker>(*this)),
+            key(kj::mv(key)),
+            parent(parent),
+            timer(timer) {}
+
+      ~ActorContainer() {
+        // We need to make sure we're removed from the actors map.
+        parent.actors.erase(key);
+      }
+
+      void active() override {
+        // We're handling a new request, cancel the eviction promise.
+        shutdownTask = kj::none;
+      }
+
+      void inactive() override {
+        KJ_IF_SOME(a, actor) {
+          KJ_IF_SOME(m, a->getHibernationManager()) {
+            // The hibernation manager needs to survive actor eviction and be passed to the actor
+            // constructor next time we create it.
+            manager = kj::addRef(*static_cast<HibernationManagerImpl*>(&m));
+          }
+        }
+        shutdownTask = handleShutdown();
+      }
+
+      // Processes the eviction of the Durable Object and hibernates active websockets.
+      kj::Promise<void> handleShutdown() {
+        // After 10 seconds of inactivity, we destroy the Worker::Actor and hibernate any active
+        // JS WebSockets.
+        // TODO(someday): We could make this timeout configurable to make testing less burdensome.
+        co_await timer.afterDelay(10 * kj::SECONDS);
+        KJ_IF_SOME(a, actor) {
+          KJ_IF_SOME(m, manager) {
+            auto& worker = a->getWorker();
+            auto workerStrongRef = kj::atomicAddRef(worker);
+            // Take an async lock, we can't use `takeAsyncLock(RequestObserver&)` since we don't
+            // have an `IncomingRequest` at this point.
+            Worker::AsyncLock asyncLock = co_await worker.takeAsyncLockWithoutRequest(nullptr);
+            Worker::Lock lock(*workerStrongRef, asyncLock);
+            m->hibernateWebSockets(lock);
+          }
+        }
+        // Destory the last strong Worker::Actor reference.
+        actor = kj::none;
+      }
+
+      kj::Own<RequestTracker> tracker;
+      // The actor is constructed after the ActorContainer so it starts off empty.
+      kj::Maybe<kj::Own<Worker::Actor>> actor;
+      kj::Maybe<kj::Own<Worker::Actor::HibernationManager>> manager;
+    private:
+      kj::String key;
+      ActorNamespace& parent;
+      kj::Maybe<kj::Promise<void>> shutdownTask;
+      kj::Timer& timer;
+    };
+
   private:
     WorkerService& service;
     kj::StringPtr className;
     const ActorConfig& config;
-    kj::HashMap<kj::String, kj::Own<Worker::Actor>> actors;
+    // If the actor is broken, we remove it from the map. However, if it's just evicted due to
+    // inactivity, we keep the ActorContainer in the map but drop the Own<Worker::Actor>. When a new
+    // request comes in, we recreate the Own<Worker::Actor>.
+    kj::HashMap<kj::String, kj::Own<ActorContainer>> actors;
     kj::TaskSet onBrokenTasks;
+    kj::Timer& timer;
 
     kj::Promise<kj::Own<WorkerInterface>> getActorThenStartRequest(
         kj::String id,
@@ -1453,7 +1533,22 @@ public:
       return service.worker->takeAsyncLockWithoutRequest(nullptr).then(
           [this, id = kj::mv(id)]
           (Worker::AsyncLock asyncLock) mutable -> kj::Own<Worker::Actor> {
-        auto actor = kj::addRef(*actors.findOrCreate(id, [&]() mutable {
+        auto& actorContainer = actors.findOrCreate(id, [&]() mutable {
+          auto container = kj::heap<ActorContainer>(kj::str(id), *this, timer);
+
+          // TODO(sqlite): Now that actors are backed by real disk, we should shut them down after
+          //   a minute of inactivity...
+          return kj::HashMap<kj::String, kj::Own<ActorContainer>>::Entry {
+            kj::str(id), kj::mv(container)
+          };
+        });
+
+        auto actor = [&]() mutable {
+          KJ_IF_SOME(a, actorContainer->actor) {
+            // This actor was used recently and hasn't been evicted, let's reuse it.
+            return a->addRef();
+          }
+          // We don't have an actor so we need to create it.
           auto& channels = KJ_ASSERT_NONNULL(service.ioChannels.tryGet<LinkedIoChannels>());
 
           auto makeActorCache =
@@ -1495,21 +1590,23 @@ public:
           // We define this event ID in the internal codebase, but to have WebSocket Hibernation
           // work for local development we need to pass an event type.
           static constexpr uint16_t hibernationEventTypeId = 8;
-          auto newActor = kj::refcounted<Worker::Actor>(
-              *service.worker, kj::none, kj::str(id), true, kj::mv(makeActorCache),
-              className, kj::mv(makeStorage), lock, kj::mv(loopback),
-              timerChannel, kj::refcounted<ActorObserver>(), kj::none, hibernationEventTypeId);
+          auto managerRef = actorContainer->manager.map(
+              [&](kj::Own<Worker::Actor::HibernationManager>& m) { return kj::addRef(*m); });
+
+          actorContainer->actor.emplace(
+              kj::refcounted<Worker::Actor>(
+                  *service.worker, *(actorContainer->tracker), kj::str(id), true,
+                  kj::mv(makeActorCache), className, kj::mv(makeStorage), lock, kj::mv(loopback),
+                  timerChannel, kj::refcounted<ActorObserver>(), kj::mv(managerRef),
+                  hibernationEventTypeId));
 
           // If the actor becomes broken, remove it from the map, so a new one will be created
           // next time.
-          onBrokenTasks.add(onActorBroken(newActor->onBroken(), id.asPtr()));
+          auto& actorRef = KJ_REQUIRE_NONNULL(actorContainer->actor);
+          onBrokenTasks.add(onActorBroken(actorRef->onBroken(), id.asPtr()));
 
-          // TODO(sqlite): Now that actors are backed by real disk, we should shut them down after
-          //   a minute of inactivity...
-          return kj::HashMap<kj::String, kj::Own<Worker::Actor>>::Entry {
-            kj::mv(id), kj::mv(newActor)
-          };
-        }));
+          return KJ_REQUIRE_NONNULL(actorContainer->actor)->addRef();
+        }();
 
         return kj::mv(actor);
       });
@@ -1524,6 +1621,8 @@ public:
         // We are intentionally ignoring any errors here. We just want to ensure
         // that the actor is removed if the onBroken promise is resolved or errors.
       }
+      // Note that we remove the entire ActorContainer from the map -- this drops the
+      // HibernationManager so any connected hibernatable websockets will be disconnected.
       actors.erase(id);
     }
   };
