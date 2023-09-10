@@ -2172,6 +2172,8 @@ public:
 
   BufferSource bytes(kj::Array<kj::byte> data) KJ_WARN_UNUSED_RESULT;
 
+  BufferSource arrayBuffer(kj::Array<kj::byte> data) KJ_WARN_UNUSED_RESULT;
+
   enum RegExpFlags {
     kNONE = v8::RegExp::Flags::kNone,
     kGLOBAL = v8::RegExp::Flags::kGlobal,
